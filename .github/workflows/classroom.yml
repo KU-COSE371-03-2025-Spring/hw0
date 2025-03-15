@@ -1,0 +1,105 @@
+name: Autograding Tests
+on:
+  - push
+  - workflow_dispatch
+  - repository_dispatch
+permissions:
+  checks: write
+  actions: read
+  contents: read
+
+jobs:
+  run-autograding-tests:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-classroom[bot]'
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker
+      run: |
+        docker run --name ku-mysql \
+        -e MYSQL_ROOT_PASSWORD=admin \
+        -d -p 3306:3306 mysql:8.0.33
+    - name: Wait for MySQL to be ready
+      run: |
+        until docker exec ku-mysql mysqladmin ping -h "127.0.0.1" --silent; do
+          echo "Waiting for MySQL..."
+          sleep 5
+        done
+        
+    - name: Load database schema
+      run: |
+        docker exec -i ku-mysql mysql -uroot -padmin -h127.0.0.1 < prob1/load.sql
+
+    - name: Run problem1
+      run: |
+        cd prob1
+        pass=0
+        total_tests=3
+        declare -A scores=( [q1]=0 [q2]=20 [q3]=20 )
+        for q in "${!scores[@]}"; do
+          echo "Running $q.sql..."
+          docker exec -i ku-mysql mysql -uroot -padmin -s classicmodels < submission/$q.sql > student-$q-result.txt || true
+          if diff -w student-$q-result.txt solutions/$q-sol.out; then
+            echo "✅ (Prob1) Test $q passed."
+            pass=$((pass + 1))
+            TOTAL_SCORE=$((TOTAL_SCORE + scores[$q]))
+          else
+            echo "❌ (Prob1) Test $q failed."
+          fi
+        done
+        echo "(prob1) Tests Passed: $pass / $total_tests"
+        echo "TOTAL_SCORE=$TOTAL_SCORE" >> $GITHUB_ENV
+      continue-on-error: true    
+        
+    - name: Configure and Build
+      run: |
+        mkdir prob2/build
+        cd prob2/build
+        cmake ..
+        cmake --build .
+
+    - name: Run problem2
+      run: |
+        cd prob2
+        mkdir -p test_outputs
+        pass_count=0
+        total_tests=3
+        for i in $(seq 1 $total_tests); do
+          ./build/kudb $i &> test_outputs/test${i}_output.txt
+          diff -u solutions/sol${i}.txt test_outputs/test${i}_output.txt > test_outputs/test${i}_diff.txt || true
+          
+          if [ ! -s test_outputs/test${i}_diff.txt ]; then
+            echo "✅ Test $i passed."
+            pass_count=$((pass_count + 1))
+          else
+            echo "❌ Test $i failed."
+          fi
+        done
+
+        TOTAL_SCORE="${{ env.TOTAL_SCORE || 0 }}"
+        echo "pass_count=$pass_count" >> $GITHUB_ENV
+        echo "total_tests=$total_tests" >> $GITHUB_ENV
+        echo "(prob2) Tests Passed: $pass_count / $total_tests"
+        echo "Final Score: $((pass_count * 20 + TOTAL_SCORE)) / 100"
+
+    - name: Post Results to PR
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const passCount = parseInt(process.env.pass_count);
+          const totalTests = parseInt(process.env.total_tests);
+          const TOTAL_SCORE = parseInt(process.env.TOTAL_SCORE);
+          const commentBody = `
+            ### Autograding Results
+            **Final Score**: $((pass_count * 20 + TOTAL_SCORE))/100
+          `;
+
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: commentBody,
+          });
